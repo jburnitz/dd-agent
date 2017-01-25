@@ -127,7 +127,7 @@ class TestCheckDockerDaemon(AgentCheckTest):
 
     @mock.patch('docker.Client.info')
     def test_devicemapper_invalid_values(self, mock_info):
-        """Invalid values are detected in _calc_percent_disk_stats, so percent should be missing"""
+        """Invalid values are detected in _calc_percent_disk_stats and 'percent' use 'free'+'used' instead of 'total' """
         mock_info.return_value = self.mock_get_info_invalid_values()
 
         self.run_check(MOCK_CONFIG, force_reload=True)
@@ -135,7 +135,7 @@ class TestCheckDockerDaemon(AgentCheckTest):
         self.assertMetric('docker.metadata.free', value=9e6)
         self.assertMetric('docker.metadata.used', value=11e6)
         self.assertMetric('docker.metadata.total', value=10e6)
-        self.assertNotIn('docker.metadata.percent', metric_names)
+        self.assertMetric('docker.metadata.percent', value=55)
 
     @mock.patch('docker.Client.info')
     def test_devicemapper_all_zeros(self, mock_info):
