@@ -103,7 +103,7 @@ class Kubernetes(AgentCheck):
         service_check_base = NAMESPACE + '.kubelet.check'
         is_ok = True
         try:
-            req = self.kubeutil.retrieve_kubelet_url(url)
+            req = self.kubeutil.perform_kubelet_query(url)
             for line in req.iter_lines():
 
                 # avoid noise; this check is expected to fail since we override the container hostname

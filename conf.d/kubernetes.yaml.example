@@ -54,29 +54,32 @@ instances:
   # kubelet port. It needs to be set if you are not using a default one (10250 or 10255)
   # kubelet_port: 10255
   #
-  # SSL configuration for querying kubelet.
+  # TLS configuration for querying kubelet.
   #
   # Available options are:
-  # - simple SSL validation (with readily available certificates)
-  # - disabling SSL validation
+  # (server auth)
+  # - simple TLS validation (with readily available certificates)
+  # - disabling TLS validation
   # - providing the server certificate
+  # (client auth)
   # - providing a client cert/key pair
+  # - using a service account bearer token
   #
-  # The default is to try and use the read-only port that doesn't require SSL
-  # And to fall back to the HTTPS API with simple SSL validation.
+  # The default is to try and use the read-only port that doesn't require TLS
+  # And to fall back to the HTTPS API with simple TLS validation.
   #
-  # Explicitly disabling ssl_verify should be used with caution:
+  # Explicitly disabling tls_verify should be used with caution:
   # if an attacker sniffs the agent requests they will see the agent's service account bearer token.
   #
-  # Providing a server cert enables SSL validation.
+  # Providing a server cert enables TLS validation.
   #
   # It is possible to providing a client cert/key pair for client auth.
-  # The agent also uses its pod bearer token (if available) when querying kubelet and the apiserver.
+  # If no such cert is passed, the agent authenticates using its pod bearer token (if available) when querying kubelet and the apiserver.
   #
   # The recommended way to pass certificates and keys to the agent is by using
   # "Secret" Kubernetes object (and to mount them as volumes).
   #
-  # kubelet_ssl_verify: True
+  # kubelet_tls_verify: True
   # kubelet_cert: /path/to/ca.pem
   # kubelet_client_crt: /path/to/client.crt
   # kubelet_client_key: /path/to/client.key

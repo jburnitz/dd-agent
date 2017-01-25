@@ -385,21 +385,22 @@ class TestKubeutil(unittest.TestCase):
     def setUp(self, _locate_kubelet):
         self.kubeutil = KubeUtil()
 
-    def test_init_ssl_settings(self):
+    @mock.patch('os.path.exists', return_value=True)
+    def test_init_tls_settings(self, *args):
         instances = [
             # (instance, expected_result)
             ({}, {'verify': True}),
-            ({'kubelet_ssl_verify': False}, {'verify': False}),
-            ({'kubelet_ssl_verify': True}, {'verify': True}),
-            ({'kubelet_ssl_verify': 'foo.pem'}, {'verify': 'foo.pem'}),
+            ({'kubelet_tls_verify': False}, {'verify': False}),
+            ({'kubelet_tls_verify': True}, {'verify': True}),
+            ({'kubelet_tls_verify': 'foo.pem'}, {'verify': 'foo.pem'}),
             ({'kubelet_cert': 'foo.pem'}, {'verify': 'foo.pem'}),
             ({'kubelet_client_crt': 'client.crt', 'kubelet_client_key': 'client.key'},
                 {'verify': True, 'kubelet_client_cert': ('client.crt', 'client.key')}),
-            ({'kubelet_ssl_verify': True, 'kubelet_client_crt': 'client.crt'}, {'verify': True}),
+            ({'kubelet_tls_verify': True, 'kubelet_client_crt': 'client.crt'}, {'verify': True}),
             ({'kubelet_client_crt': 'client.crt'}, {'verify': True})
         ]
         for instance, result in instances:
-            self.assertEqual(self.kubeutil._init_ssl_settings(instance), result)
+            self.assertEqual(self.kubeutil._init_tls_settings(instance), result)
 
 
     ##### Test _locate_kubelet #####
@@ -419,7 +420,7 @@ class TestKubeutil(unittest.TestCase):
             ({'kubelet_port': '1337'}, 'http://test_docker_host:1337'),
             ({'host': 'test_explicit_host', 'kubelet_port': '1337'}, 'http://test_explicit_host:1337')
         ]
-        with mock.patch('utils.kubernetes.kubeutil.KubeUtil.retrieve_kubelet_url', return_value=True):
+        with mock.patch('utils.kubernetes.kubeutil.KubeUtil.perform_kubelet_query', return_value=True):
             for instance, result in no_auth_no_ssl_instances:
                 self.assertEqual(self.kubeutil._locate_kubelet(instance), result)
 
@@ -434,13 +435,13 @@ class TestKubeutil(unittest.TestCase):
         ]
 
         def side_effect(url):
-            """Mock KubeUtil.retrieve_kubelet_url"""
+            """Mock KubeUtil.perform_kubelet_query"""
             if url.startswith('https://'):
                 return True
             else:
                 raise Exception()
 
-        with mock.patch('utils.kubernetes.kubeutil.KubeUtil.retrieve_kubelet_url', side_effect=side_effect):
+        with mock.patch('utils.kubernetes.kubeutil.KubeUtil.perform_kubelet_query', side_effect=side_effect):
             for instance, result in no_auth_no_verify_instances:
                 self.assertEqual(self.kubeutil._locate_kubelet(instance), result)
 
@@ -449,10 +450,10 @@ class TestKubeutil(unittest.TestCase):
     @mock.patch('utils.kubernetes.kubeutil.KubeUtil.get_auth_token', return_value='foo')
     def test_locate_kubelet_verify_and_auth(self, *args):
         """
-        Test kubelet connection with SSL. Also look for auth token.
+        Test kubelet connection with TLS. Also look for auth token.
         """
         no_auth_instances = [
-            # instance, ssl_settings, expected_result
+            # instance, tls_settings, expected_result
             ({}, {'verify': True}, 'https://test_k8s_host:10250'),
             ({'kubelet_port': '1337'}, {'verify': 'test.pem'}, 'https://test_k8s_host:1337'),
             (
@@ -468,23 +469,23 @@ class TestKubeutil(unittest.TestCase):
         ]
 
         def side_effect(url, **kwargs):
-            """Mock KubeUtil.retrieve_kubelet_url"""
+            """Mock KubeUtil.perform_kubelet_query"""
             if url.startswith('https://') and '10255' not in url:
                 return True
             else:
                 raise Exception()
 
-        # no auth / SSL with verify
-        for instance, ssl_settings, result in no_auth_instances:
+        # no auth / TLS with verify
+        for instance, tls_settings, result in no_auth_instances:
             with mock.patch('utils.kubernetes.kubeutil.requests') as req:
                 req.get = mock.MagicMock(side_effect=side_effect)
-                self.kubeutil.ssl_settings = ssl_settings
+                self.kubeutil.tls_settings = tls_settings
                 self.assertEqual(self.kubeutil._locate_kubelet(instance), result)
                 req.get.assert_called_with(result + '/healthz',  # test endpoint
                     timeout=10,
-                    verify=ssl_settings.get('verify', False),
-                    cert=ssl_settings.get('kubelet_client_cert'),
-                    headers={'Authorization': 'Bearer foo'},  # auth
+                    verify=tls_settings.get('verify', False),
+                    headers={'Authorization': 'Bearer foo'} if 'kubelet_client_cert' not in tls_settings else None,
+                    cert=tls_settings.get('kubelet_client_cert'),
                     params={'verbose': True}
                 )
 
@@ -492,21 +493,14 @@ class TestKubeutil(unittest.TestCase):
     def test_get_node_hostname(self, _get_auth_tkn):
         node_lists = [
             (json.loads(Fixtures.read_file('filtered_node_list_1_4.json', string_escape=False)), 'ip-10-0-0-179'),
-            ({'items': [{'foo': 'bar'}]}, None)
-        ]
-
-        exception_node_lists = [
-            {'items': []},
-            {'items': [{'foo': 'bar'}, {'bar': 'foo'}]}
+            ({'items': [{'foo': 'bar'}]}, None),
+            ({'items': []}, None),
+            ({'items': [{'foo': 'bar'}, {'bar': 'foo'}]}, None)
         ]
 
         for node_list, expected_result in node_lists:
             with mock.patch('utils.kubernetes.kubeutil.KubeUtil.retrieve_json_auth', return_value=node_list):
                 self.assertEqual(self.kubeutil.get_node_hostname('ip-10-0-0-179'), expected_result)
-
-        for node_list in exception_node_lists:
-            with mock.patch('utils.kubernetes.kubeutil.KubeUtil.retrieve_json_auth', return_value=node_list):
-                self.assertRaises(Exception, self.kubeutil.get_node_hostname, 'ip-10-0-0-179')
 
     @mock.patch('utils.kubernetes.KubeUtil.retrieve_pods_list', side_effect=['foo'])
     @mock.patch('utils.kubernetes.KubeUtil.extract_kube_labels')
@@ -538,7 +532,7 @@ class TestKubeutil(unittest.TestCase):
         labels = set(inn for out in res.values() for inn in out)
         self.assertEqual(len(labels), 3)
 
-    @mock.patch('utils.kubernetes.kubeutil.KubeUtil.retrieve_kubelet_url')
+    @mock.patch('utils.kubernetes.kubeutil.KubeUtil.perform_kubelet_query')
     def test_retrieve_pods_list(self, retrieve_url):
         self.kubeutil.retrieve_pods_list()
         retrieve_url.assert_called_twice_with(self.kubeutil.pods_list_url, verbose=True, timeout=10)
@@ -555,7 +549,7 @@ class TestKubeutil(unittest.TestCase):
 
     @mock.patch('utils.kubernetes.kubeutil.KubeUtil.get_auth_token', return_value='foo')
     @mock.patch('utils.kubernetes.kubeutil.requests')
-    def test_retrieve_kubelet_url(self, req, _get_auth_tkn):
+    def test_perform_kubelet_query(self, req, _get_auth_tkn):
         base_params = {'timeout': 10, 'verify': False,
             'params': {'verbose': True}, 'cert': None, 'headers': None}
 
@@ -570,12 +564,12 @@ class TestKubeutil(unittest.TestCase):
             ('https://test.com', {'verify': True}, dict(base_params.items() + verify_true.items() + auth_token_header.items())),
             ('https://test.com', {'verify': 'kubelet.pem'}, dict(base_params.items() + verify_cert.items() + auth_token_header.items())),
             ('https://test.com', {'kubelet_client_cert': ('client.crt', 'client.key')},
-                dict(base_params.items() + verify_true.items() + client_cert.items() + auth_token_header.items())),
+                dict(base_params.items() + verify_true.items() + client_cert.items())),
         ]
         for url, ssl_context, expected_params in instances:
             req.get.reset_mock()
-            self.kubeutil.ssl_settings = ssl_context
-            self.kubeutil.retrieve_kubelet_url(url)
+            self.kubeutil.tls_settings = ssl_context
+            self.kubeutil.perform_kubelet_query(url)
             req.get.assert_called_with(url, **expected_params)
 
     @mock.patch('utils.kubernetes.kubeutil.requests')

@@ -7,6 +7,7 @@ from collections import defaultdict
 import logging
 import os
 from urlparse import urljoin
+from urllib import urlencode
 
 # project
 from util import check_yaml
@@ -21,7 +22,7 @@ log = logging.getLogger('collector')
 
 KUBERNETES_CHECK_NAME = 'kubernetes'
 
-DEFAULT_SSL_VERIFY = True
+DEFAULT_TLS_VERIFY = True
 
 
 class KubeUtil:
@@ -67,11 +68,15 @@ class KubeUtil:
         self.kubernetes_api_url = 'https://%s/api/v1' % (os.environ.get('KUBERNETES_SERVICE_HOST') or self.DEFAULT_MASTER_NAME)
 
         # kubelet
-        self.ssl_settings = self._init_ssl_settings(instance)
-        self.kubelet_api_url = self._locate_kubelet(instance)
-        if not self.kubelet_api_url:
-            log.exception("Kubernetes check exiting, cannot run without access to kubelet.")
-            return
+        self.tls_settings = self._init_tls_settings(instance)
+        try:
+            self.kubelet_api_url = self._locate_kubelet(instance)
+            if not self.kubelet_api_url:
+                raise Exception("Couldn't find a method to connect to kubelet.")
+        except Exception as ex:
+            log.error("Kubernetes check exiting, cannot run without access to kubelet.")
+            raise ex
+
         self.kubelet_host = self.kubelet_api_url.split(':')[1].lstrip('/')
         self.pods_list_url = urljoin(self.kubelet_api_url, KubeUtil.PODS_LIST_PATH)
         self.kube_health_url = urljoin(self.kubelet_api_url, KubeUtil.KUBELET_HEALTH_PATH)
@@ -86,24 +91,24 @@ class KubeUtil:
         # default value is 0 but TTL for k8s events is one hour anyways
         self.last_event_collection_ts = 0
 
-    def _init_ssl_settings(self, instance):
+    def _init_tls_settings(self, instance):
         """
-        Extract SSL settings from the config.
+        Extract TLS settings from the config.
         """
-        ssl_settings = {}
+        tls_settings = {}
 
         client_crt = instance.get('kubelet_client_crt')
         client_key = instance.get('kubelet_client_key')
-        if client_crt and client_key:
-            ssl_settings['kubelet_client_cert'] = (client_crt, client_key)
+        if client_crt and client_key and os.path.exists(client_crt) and os.path.exists(client_key):
+            tls_settings['kubelet_client_cert'] = (client_crt, client_key)
 
         cert = instance.get('kubelet_cert')
         if cert:
-            ssl_settings['verify'] = cert
+            tls_settings['verify'] = cert
         else:
-            ssl_settings['verify'] = instance.get('kubelet_ssl_verify', DEFAULT_SSL_VERIFY)
+            tls_settings['verify'] = instance.get('kubelet_tls_verify', DEFAULT_TLS_VERIFY)
 
-        return ssl_settings
+        return tls_settings
 
     def _locate_kubelet(self, instance):
         """
@@ -113,10 +118,10 @@ class KubeUtil:
         """
         host = os.environ.get('KUBERNETES_KUBELET_HOST') or instance.get("host")
         if not host:
-            # if no hostname was provided, use the docker hostname if ssl
+            # if no hostname was provided, use the docker hostname if cert
             # validation is not required, the kubernetes hostname otherwise.
             docker_hostname = self.docker_util.get_hostname()
-            if self.ssl_settings['verify']:
+            if self.tls_settings['verify']:
                 try:
                     k8s_hostname = self.get_node_hostname(docker_hostname)
                     host = k8s_hostname or docker_hostname
@@ -130,30 +135,31 @@ class KubeUtil:
             port = instance.get('kubelet_port', KubeUtil.DEFAULT_HTTP_KUBELET_PORT)
             no_auth_url = 'http://%s:%s' % (host, port)
             test_url = urljoin(no_auth_url, KubeUtil.KUBELET_HEALTH_PATH)
-            self.retrieve_kubelet_url(test_url)
+            self.perform_kubelet_query(test_url)
             return no_auth_url
         except Exception:
             log.debug("Couldn't query kubelet over HTTP, assuming it's not in no_auth mode.")
 
-        try:
-            port = instance.get('kubelet_port', KubeUtil.DEFAULT_HTTPS_KUBELET_PORT)
+        port = instance.get('kubelet_port', KubeUtil.DEFAULT_HTTPS_KUBELET_PORT)
 
-            https_url = 'https://%s:%s' % (host, port)
-            test_url = urljoin(https_url, KubeUtil.KUBELET_HEALTH_PATH)
-            self.retrieve_kubelet_url(test_url)
+        https_url = 'https://%s:%s' % (host, port)
+        test_url = urljoin(https_url, KubeUtil.KUBELET_HEALTH_PATH)
+        self.perform_kubelet_query(test_url)
 
-            return https_url
-        except Exception as ex:
-            log.error("Kubelet unreachable.\nPlease configure the no-auth endpoint or configure authentication: %s" % str(ex))
+        return https_url
 
     def get_node_hostname(self, host):
-        node_filter = 'labelSelector=kubernetes.io/hostname'
+        """
+        Query the API server for the kubernetes hostname of the node
+        using the docker hostname as a filter.
+        """
+        node_filter = {'labelSelector': 'kubernetes.io/hostname=%s' % host}
         node = self.retrieve_json_auth(
-            self.kubernetes_api_url + '/nodes?%s%%3D%s' % (node_filter, host),
+            self.kubernetes_api_url + '/nodes?%s' % urlencode(node_filter),
             self.get_auth_token()
         )
         if len(node['items']) != 1:
-            raise Exception('Error while getting node hostname: expected 1 node, got %s.' % len(node['items']))
+            log.error('Error while getting node hostname: expected 1 node, got %s.' % len(node['items']))
         else:
             addresses = (node or {}).get('items', [{}])[0].get('status', {}).get('addresses', [])
             for address in addresses:
@@ -195,7 +201,7 @@ class KubeUtil:
 
         TODO: the list of pods could be cached with some policy to be decided.
         """
-        return self.retrieve_kubelet_url(self.pods_list_url).json()
+        return self.perform_kubelet_query(self.pods_list_url).json()
 
     def retrieve_machine_info(self):
         """
@@ -209,19 +215,18 @@ class KubeUtil:
         """
         return retrieve_json(self.metrics_url)
 
-    def retrieve_kubelet_url(self, url, verbose=True, timeout=10):
+    def perform_kubelet_query(self, url, verbose=True, timeout=10):
         """
-        Perform and return a GET request against kubelet. Support auth and SSL validation.
+        Perform and return a GET request against kubelet. Support auth and TLS validation.
         """
-        ssl_context = self.ssl_settings
+        tls_context = self.tls_settings
 
-        cert = headers = None
-        verify = ssl_context.get('verify', DEFAULT_SSL_VERIFY)
+        headers = None
+        cert = tls_context.get('kubelet_client_cert')
+        verify = tls_context.get('verify', DEFAULT_TLS_VERIFY)
 
-        if 'kubelet_client_cert' in ssl_context:
-            cert = ssl_context['kubelet_client_cert']
-
-        if url.lower().startswith('https'):
+        # if cert-based auth is enabled, don't use the token.
+        if not cert and url.lower().startswith('https'):
             headers = {'Authorization': 'Bearer {}'.format(self.get_auth_token())}
 
         return requests.get(url, timeout=timeout, verify=verify,
@@ -232,11 +237,11 @@ class KubeUtil:
         Kubernetes API requires authentication using a token available in
         every pod.
 
-        We try to verify ssl certificate if available.
+        We try to verify the certificate if available.
         """
         if verify is None:
             verify = self.CA_CRT_PATH if os.path.exists(self.CA_CRT_PATH) else False
-        log.debug('ssl validation: {}'.format(verify))
+        log.debug('tls validation: {}'.format(verify))
         headers = {'Authorization': 'Bearer {}'.format(auth_token)}
         r = requests.get(url, timeout=timeout, headers=headers, verify=verify)
         r.raise_for_status()
